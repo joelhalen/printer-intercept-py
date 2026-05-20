@@ -1,8 +1,16 @@
 {
   "listenPort": 9100,
-  "printerHost": "192.168.1.X",
+  "printerHost": "10.3.10.209",
   "printerPort": 9100,
+  "mode": "transparent",
   "outputDir": "./captured_jobs",
+  "organizeByJobMeta": true,
+  "storagePathTemplate": "{productId}/lot_{lot}/{side}",
+  "captureJobs": true,
+  "autoConvert": true,
+  "autoConvertForm": false,
+  "autoConvertDir": "converted",
   "forwardToPrinter": true,
+  "relayPjlToPrinter": true,
   "logLevel": "verbose"
 }

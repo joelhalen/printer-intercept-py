@@ -37,13 +37,20 @@ Open `config.json` and set `printerHost` to the Xerox's IP:
 ```json
 {
   "listenPort": 9100,
-  "printerHost": "192.168.1.100",   ← Your Xerox B310 IP here
+  "printerHost": "192.168.1.100",
   "printerPort": 9100,
+  "mode": "transparent",
+  "organizeByJobMeta": true,
+  "storagePathTemplate": "{productId}/lot_{lot}/{side}",
+  "captureJobs": true,
   "outputDir": "./captured_jobs",
-  "forwardToPrinter": true,
   "logLevel": "verbose"
 }
 ```
+
+**`mode`: `transparent` (recommended)** — pipes every byte ST-50 ↔ Xerox on one TCP
+session, like the old direct ethernet cable. Printer PJL/status replies go back to the
+ST-50 unchanged. **`capture`** — older mode that buffers and interprets PJL separately.
 
 ### 4. Allow port 9100 through Windows Firewall
 
@@ -67,17 +74,116 @@ Double-click `start-proxy.bat`, or run in Command Prompt:
 node proxy.js
 ```
 
+### 7. Sniff the Xerox directly (debug)
+
+From the proxy PC (same network as the printer):
+
+```
+run-sniff-portable.bat 10.3.10.209
+```
+
+Saves raw printer replies under `sniff_logs/`. Compare with proxy log lines
+`Printer → ST-50` in transparent mode.
+
+### 8. Compare proxy vs real printer (when ST-50 says "not found")
+
+On the intercept PC, with the Xerox IP from its front panel:
+
+```
+node compare.js 10.3.25.25 <xerox-ip>
+```
+
+If the proxy shows **no PJL response** but the Xerox does, set `relayPjlToPrinter: true`
+in `config.json` (default) and restart `node proxy.js`. The proxy will forward
+discovery probes to the Xerox and return the same answers the ST-50 already accepts.
+
+While the ST-50 tries to print, watch the proxy console:
+- **No** `New connection` → ST-50 is not reaching this PC (wrong IP, firewall, or port).
+- **`New connection` + First bytes** → note the hex dump; that is what the ST-50 sent.
+
+Check what is bound to port 9100 on the intercept PC:
+
+```
+netstat -ano | findstr :9100
+```
+
+Only `node.exe` (proxy.js) should listen while testing.
+
 ---
 
 ## Files
 
 | File | Purpose |
 |------|---------|
-| `proxy.js` | Main proxy server |
+| `proxy.js` | Main proxy server (`mode`: `transparent` or `capture`) |
+| `sniff.js` | Query Xerox port 9100 and save raw responses |
+| `convert-ps.js` | Convert captured `.ps` to CSV / TXT |
+| `run-convert-portable.bat` | Run converter with bundled Node |
 | `resend.js` | Manually re-send a captured file to the printer |
 | `config.json` | Configuration (edit this) |
 | `start-proxy.bat` | Windows launcher |
 | `captured_jobs/` | Saved .ps files appear here (auto-created) |
+
+---
+
+## Converting captured PostScript to CSV / Excel
+
+With **`autoConvert`: `true`** in `config.json` (enabled by default in the sample config),
+each captured job is converted automatically next to the `.ps` file under a `converted/` subfolder.
+
+### Storage layout (organized jobs)
+
+When `organizeByJobMeta` is true, paths are parsed from the ST-50 PJL header, e.g.:
+
+`@PJL JOB NAME="1A;'1392B-10';'002';20260520;062136;ST50;00215"`
+
+| Field | Folder token | Example |
+|-------|----------------|---------|
+| Product ID | `{productId}` | `1392B-10` |
+| Lot / batch | `{lot}` or `{batch}` | `002` |
+| Press side (Comment) | `{side}` | `LEFT`, `RIGHT`, `LSFP`, `RSFP`, `L`, `R` (optional) |
+
+`{side}` is omitted from the path when not found on the report. Test type (`IN_PR_HARDNESS`, `UNCOATED`) is still included in the **filename**, not as a folder.
+
+Example tree:
+
+```
+captured_jobs/
+  1392B-10/
+    lot_002/
+      RIGHT/
+        job_20260520_062136_IN_PR_HARDNESS_RIGHT.ps
+        converted/
+          job_20260520_062136_IN_PR_HARDNESS_RIGHT.csv
+```
+
+PJL-only discovery probes (no print job) are not saved. Set `"organizeByJobMeta": false` to use a flat `captured_jobs/` folder again.
+
+ST-50 jobs are text positioned on a grid (not a flat PDF). You can also convert manually:
+
+```
+run-convert-portable.bat captured_jobs\job_20260520_083956.ps
+run-convert-portable.bat captured_jobs
+run-convert-portable.bat captured_jobs\job.ps --form
+```
+
+Outputs go to `captured_jobs/converted/`:
+
+| File | Use |
+|------|-----|
+| `*.csv` | Open in Excel / Google Sheets |
+| `*.txt` | Fixed-width preview |
+| `*.csv` | One CSV per job (all pages combined) |
+| `*.json` | Structured data for scripts |
+
+Conversion uses **drawn table cell rectangles** in the PostScript for a 1:1 grid (one CSV cell per printed cell).
+Re-run `run-convert-portable.bat captured_jobs` after upgrading if you still have old merged CSVs.
+
+**PDF (optional):** install [Ghostscript](https://ghostscript.com/releases/gsdnld.html), then:
+
+```
+gswin64c -dNOPAUSE -sDEVICE=pdfwrite -o report.pdf captured_jobs\job.ps
+```
 
 ---
 
@@ -98,8 +204,16 @@ node resend.js captured_jobs\job_20240518_143022.ps
 | `listenPort` | `9100` | Port this proxy listens on |
 | `printerHost` | — | Xerox B310 IP address |
 | `printerPort` | `9100` | Xerox port (rarely needs changing) |
-| `outputDir` | `./captured_jobs` | Where .ps files are saved |
-| `forwardToPrinter` | `true` | Set `false` to capture only, no printing |
+| `mode` | `transparent` | `transparent` = pipe bytes; `capture` = buffer/PJL mode |
+| `organizeByJobMeta` | `true` | Folder per product / lot / press (from PJL `JOB NAME`) |
+| `storagePathTemplate` | `{productId}/lot_{lot}/{side}` | Path under `outputDir` |
+| `captureJobs` | `true` | In transparent mode, save ST-50→printer stream on close |
+| `autoConvert` | `false` | After each `.ps` capture, write CSV/TXT/JSON |
+| `autoConvertForm` | `false` | Legacy merge mode (leave `false` for 1:1 cells) |
+| `autoConvertDir` | `converted` | Folder under `outputDir` for converted files |
+| `outputDir` | `./captured_jobs` | Where captured streams are saved |
+| `forwardToPrinter` | `true` | `capture` mode only |
+| `relayPjlToPrinter` | `true` | `capture` mode only |
 | `logLevel` | `verbose` | `verbose` / `normal` / `quiet` |
 
 ---
