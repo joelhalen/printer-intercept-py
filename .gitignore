@@ -1,2 +1,9 @@
-captured_jobs/
-node/
+*.csv
+*.json
+*.ps
+*.txt
+*.log
+*.exe
+*.exe.*
+*.zip
+*.bat

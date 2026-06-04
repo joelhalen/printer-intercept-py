@@ -52,6 +52,51 @@ Open `config.json` and set `printerHost` to the Xerox's IP:
 session, like the old direct ethernet cable. Printer PJL/status replies go back to the
 ST-50 unchanged. **`capture`** — older mode that buffers and interprets PJL separately.
 
+#### Multiple ST-50s → different printers
+
+When more than one instrument connects to this proxy, add a `sources` list. Each entry
+names the client, maps its IP to a printer, and stores captures under that name:
+
+```json
+{
+  "printerHost": "10.3.10.48",
+  "sources": [
+    {
+      "name": "st50-line1",
+      "from": "10.3.10.49",
+      "printerHost": "10.3.10.48"
+    },
+    {
+      "name": "st50-line2",
+      "from": "10.3.10.50",
+      "printerHost": "10.3.10.52"
+    }
+  ],
+  "unmappedSourceFolder": "_unmapped"
+}
+```
+
+- **`from`** — ST-50 IP (string) or list of IPs sharing one name/printer.
+- **`name`** — folder under `captured_jobs/` (letters, numbers, dashes, underscores).
+- **`printerHost`** — Xerox (or other) IP for jobs from that ST-50.
+- Top-level **`printerHost`** — used for unmapped clients and as default when a source omits `printerHost`.
+
+Example capture path:
+
+```
+captured_jobs/
+  st50-line1/
+    1392B-10/
+      lot_002/
+        RIGHT/
+          job_….ps
+  st50-line2/
+    …
+```
+
+Clients not listed in `sources` still forward to the default `printerHost` and save under
+`captured_jobs/_unmapped/<client-ip>/…`.
+
 ### 4. Allow port 9100 through Windows Firewall
 
 Run this in an **Administrator** Command Prompt:
@@ -68,11 +113,53 @@ instead of the Xerox's IP. The port should be 9100 (or left as default).
 
 ### 6. Start the proxy
 
-Double-click `start-proxy.bat`, or run in Command Prompt:
+**Option A — manual (testing):** Double-click `start-proxy.bat`, or run:
 
 ```
 node proxy.js
 ```
+
+**Option B — Windows Service (runs at boot):** Install globally once:
+
+```
+npm install -g qckwinsvc
+```
+
+From the `print-server` folder, open **Command Prompt as Administrator** (not PowerShell — `sc` conflicts there). Use **non-interactive** flags so uninstall does not re-prompt for install settings:
+
+```
+cd /d C:\xampp\git-htdocs\print-server
+```
+
+**Install** (letters and dashes only in `--name`; no spaces):
+
+```
+qckwinsvc --name Printer-Server-Intercept --description "Print proxy on port 9100" --script C:\xampp\git-htdocs\print-server\proxy.js --startImmediately y
+```
+
+**Uninstall** (must pass the same `--name` and `--script` as install):
+
+```
+qckwinsvc --uninstall --name Printer-Server-Intercept --script C:\xampp\git-htdocs\print-server\proxy.js
+```
+
+The installer creates a `daemon\` folder with logs. Check status:
+
+```
+sc.exe query printerserverintercept.exe
+```
+
+Logs: `daemon\printerserverintercept.out.log` and `.err.log`.
+
+**Do not run `start-proxy.bat` or `node proxy.js` while the service is running** — both bind port 9100 and the second instance will fail with “Port 9100 is already in use.”
+
+Optional — restart the service process if it crashes (run once after install):
+
+```
+sc.exe failure printerserverintercept.exe reset= 86400 actions= restart/60000/restart/60000/restart/60000
+```
+
+(A harmless `padLevels` warning from `qckwinsvc` can be ignored.)
 
 ### 7. Sniff the Xerox directly (debug)
 
@@ -119,7 +206,11 @@ Only `node.exe` (proxy.js) should listen while testing.
 | `sniff.js` | Query Xerox port 9100 and save raw responses |
 | `convert-ps.js` | Convert captured `.ps` to CSV / TXT |
 | `run-convert-portable.bat` | Run converter with bundled Node |
-| `resend.js` | Manually re-send a captured file to the printer |
+| `resend.js` | Manually re-send a captured `.ps` file to the printer |
+| `convert-to-ps.js` | Convert PDF / DOCX / CSV → PostScript |
+| `print-document.js` | Convert (if needed) and print to a `config.json` printer target |
+| `csv-to-ps.js` | Built-in CSV → PostScript (fallback without LibreOffice) |
+| `printer-targets.js` | Printer list + JetDirect send (shared with PHP app) |
 | `config.json` | Configuration (edit this) |
 | `start-proxy.bat` | Windows launcher |
 | `captured_jobs/` | Saved .ps files appear here (auto-created) |
@@ -189,11 +280,69 @@ gswin64c -dNOPAUSE -sDEVICE=pdfwrite -o report.pdf captured_jobs\job.ps
 
 ## Re-sending a captured job
 
-If you need to re-print a saved job:
+If you need to re-print a saved job from the command line:
 
 ```
 node resend.js captured_jobs\job_20240518_143022.ps
+node resend.js captured_jobs\job_20240518_143022.ps --printer default
+node resend.js --list-printers
 ```
+
+Printer targets come from `config.json` (`printerHost` and optional `sources[].printerHost`).
+The same target IDs are used by the MegaFood pressing app **Job Browser** (Print button on each CSV).
+
+| Target id | Meaning |
+|-----------|---------|
+| `default` | Top-level `printerHost` / `printerPort` |
+| `source:<name>` | Printer for that `sources[].name` entry |
+
+When `autoConvert` is on, CSV files live under `converted/` next to the `.ps` capture.
+Re-print always sends the **`.ps`** bytes (not the CSV), matching the original ST-50 → proxy → printer stream.
+
+---
+
+## Printing PDF / DOCX / CSV (convert → PostScript → printer)
+
+The Xerox B310 expects **PostScript on port 9100**. Use these tools to convert application
+documents and send them to any printer target in `config.json` (same as ST-50 forwarding).
+
+### Requirements
+
+| Tool | Used for |
+|------|----------|
+| [Ghostscript](https://ghostscript.com/releases/gsdnld.html) (`gswin64c`) | PDF → PS (required for PDF); also DOCX→PDF→PS on Windows |
+| [LibreOffice](https://www.libreoffice.org/) (`soffice`) | DOCX / CSV / PDF → PS (optional but recommended) |
+| Microsoft Word | Windows fallback: DOCX → PDF when LibreOffice is not installed |
+
+Auto-detection looks in PATH and standard install folders. Override paths in `config.json`:
+
+```json
+"convertToPs": {
+  "tempDir": "./temp/print_jobs",
+  "ghostscriptPath": "",
+  "libreOfficePath": "",
+  "wordComEnabled": true
+}
+```
+
+### Command line
+
+```
+run-convert-to-ps.bat C:\path\report.pdf
+run-print-document.bat C:\path\first_piece.docx --printer source:MFG
+run-print-document.bat C:\path\data.csv --printer default --json
+node print-document.js --list-printers
+```
+
+| Format | Conversion path |
+|--------|-----------------|
+| `.ps` | Passthrough (no conversion) |
+| `.pdf` | Ghostscript `ps2write` |
+| `.docx` | LibreOffice → PS, or Word COM → PDF → Ghostscript |
+| `.csv` | LibreOffice → PS, or built-in `csv-to-ps.js` table layout |
+
+The MegaFood pressing PHP app calls `print-document.js` automatically via `PrinterService`
+when Node.js and the print-server folder are available (`PRINT_SERVER_PATH`).
 
 ---
 
@@ -202,8 +351,10 @@ node resend.js captured_jobs\job_20240518_143022.ps
 | Option | Default | Description |
 |--------|---------|-------------|
 | `listenPort` | `9100` | Port this proxy listens on |
-| `printerHost` | — | Xerox B310 IP address |
+| `printerHost` | — | Default Xerox IP (and fallback for unmapped clients) |
 | `printerPort` | `9100` | Xerox port (rarely needs changing) |
+| `sources` | `[]` | Per–ST-50 routes: `name`, `from` (IP), `printerHost` (optional `printerPort`) |
+| `unmappedSourceFolder` | `_unmapped` | Subfolder under `outputDir` for clients not in `sources` |
 | `mode` | `transparent` | `transparent` = pipe bytes; `capture` = buffer/PJL mode |
 | `organizeByJobMeta` | `true` | Folder per product / lot / press (from PJL `JOB NAME`) |
 | `storagePathTemplate` | `{productId}/lot_{lot}/{side}` | Path under `outputDir` |
@@ -215,6 +366,7 @@ node resend.js captured_jobs\job_20240518_143022.ps
 | `forwardToPrinter` | `true` | `capture` mode only |
 | `relayPjlToPrinter` | `true` | `capture` mode only |
 | `logLevel` | `verbose` | `verbose` / `normal` / `quiet` |
+| `convertToPs` | see above | Paths and temp dir for PDF/DOCX/CSV → PS printing |
 
 ---
 
@@ -224,6 +376,15 @@ node resend.js captured_jobs\job_20240518_143022.ps
 > Windows Print Spooler can claim port 9100. Open Services (services.msc),
 > find "Print Spooler", stop it, and set it to Manual — or change `listenPort`
 > to 9101 and update the ST-50 accordingly.
+>
+> If you installed the Windows service, also stop any manual `node proxy.js`
+> (or `start-proxy.bat`) and restart only the service. See `daemon\*.err.log`.
+
+**Windows service installed but proxy not listening**
+> `sc query Printer-Server-Intercept` should show `RUNNING`.
+> Read `daemon\printerserverintercept.err.log` for bind errors.
+> Confirm `config.json` and `proxy.js` paths in `daemon\printerserverintercept.xml`
+> point at this folder (reinstall with `qckwinsvc` if you moved the project).
 
 **ST-50 can't connect**
 > Confirm Windows Firewall allows port 9100 (see step 4).

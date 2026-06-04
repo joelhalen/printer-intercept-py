@@ -12,6 +12,12 @@ const fs = require("fs");
 const path = require("path");
 const { convertFile } = require("./convert-ps");
 const { resolveJobPaths, formatMetaLog } = require("./job-meta");
+const {
+  isPrinterConfigured,
+  resolveConnectionContext,
+  formatRouteLabel,
+  listSourceRoutes,
+} = require("./source-routing");
 
 // ─── Configuration ────────────────────────────────────────────────────────────
 
@@ -33,6 +39,17 @@ const DEFAULT_CONFIG = {
   forwardToPrinter: true,     // capture mode only: forward after buffering
   relayPjlToPrinter: true,    // capture mode only: PJL probe relay
   logLevel: "verbose",        // "verbose" | "normal" | "quiet"
+  // Optional per–ST-50 routing (see README). When set, captures go to
+  // outputDir/<name>/… and each source can use its own printerHost.
+  sources: [],
+  unmappedSourceFolder: "_unmapped",
+  // Document → PostScript for programmatic printing (see convert-to-ps.js, print-document.js)
+  convertToPs: {
+    tempDir: "./temp/print_jobs",
+    ghostscriptPath: "",
+    libreOfficePath: "",
+    wordComEnabled: true,
+  },
 };
 
 function loadConfig() {
@@ -252,7 +269,7 @@ function relayPjlToPrinterOnce(payload, cfg) {
 }
 
 async function relayPjlToPrinter(data, cfg) {
-  const printerReady = cfg.printerHost && cfg.printerHost !== "192.168.1.X";
+  const printerReady = isPrinterConfigured(cfg.printerHost);
   if (!printerReady) {
     throw new Error("printerHost not configured");
   }
@@ -374,9 +391,9 @@ async function finishJob(socket, chunks, cfg, remote) {
 
     // ── Forward to printer ──
     if (cfg.forwardToPrinter) {
-      const printerReady = cfg.printerHost && cfg.printerHost !== "192.168.1.X";
+      const printerReady = isPrinterConfigured(cfg.printerHost);
       if (!printerReady) {
-        log("normal", `  Skipping forward — printerHost not configured in config.json`);
+        log("normal", `  Skipping forward — printerHost not configured for this source`);
       } else {
         try {
           await forwardToPrinter(data, cfg);
@@ -399,14 +416,25 @@ function isPjlProbeOnly(data) {
 
 // ─── Transparent relay (ST-50 ↔ printer, byte-for-byte) ─────────────────────
 
-function handleTransparent(clientSocket, cfg) {
-  const remote = `${clientSocket.remoteAddress}:${clientSocket.remotePort}`;
-  const printerReady = cfg.printerHost && cfg.printerHost !== "192.168.1.X";
+function logConnectionOpen(remote, ctx, mode) {
+  const route = formatRouteLabel(ctx);
+  const tag = route ? ` source=${route}` : "";
+  log("normal", `New connection from ${remote} [${mode}]${tag}`);
+  if (ctx.hasSources && !ctx.mapped) {
+    log("normal", `  Warning: ${ctx.clientIp} not in config.sources — using default printer, folder ${ctx.config.outputDir}`);
+  }
+}
 
-  log("normal", `New connection from ${remote} [transparent]`);
+function handleTransparent(clientSocket, baseCfg) {
+  const remote = `${clientSocket.remoteAddress}:${clientSocket.remotePort}`;
+  const ctx = resolveConnectionContext(baseCfg, clientSocket.remoteAddress);
+  const cfg = ctx.config;
+  const printerReady = isPrinterConfigured(cfg.printerHost);
+
+  logConnectionOpen(remote, ctx, "transparent");
 
   if (!printerReady) {
-    log("normal", `  ERROR: printerHost not set in config.json`);
+    log("normal", `  ERROR: no printerHost for ${ctx.clientIp} (check config.sources or printerHost)`);
     clientSocket.destroy();
     return;
   }
@@ -461,7 +489,9 @@ function handleTransparent(clientSocket, cfg) {
 
   printerSocket.connect(cfg.printerPort, cfg.printerHost, () => {
     connected = true;
-    log("normal", `  Linked ${remote} ↔ ${cfg.printerHost}:${cfg.printerPort}`);
+    const via = formatRouteLabel(ctx);
+    const label = via ? `${via} (${ctx.clientIp})` : remote;
+    log("normal", `  Linked ${label} ↔ ${cfg.printerHost}:${cfg.printerPort}`);
     for (const chunk of pendingToPrinter) printerSocket.write(chunk);
     pendingToPrinter = [];
   });
@@ -487,9 +517,18 @@ function handleTransparent(clientSocket, cfg) {
   printerSocket.on("close", finish);
 }
 
-function handleJob(socket, cfg) {
+function handleJob(socket, baseCfg) {
   const remote = `${socket.remoteAddress}:${socket.remotePort}`;
-  log("normal", `New connection from ${remote}`);
+  const ctx = resolveConnectionContext(baseCfg, socket.remoteAddress);
+  const cfg = ctx.config;
+
+  logConnectionOpen(remote, ctx, "capture");
+
+  if (!isPrinterConfigured(cfg.printerHost)) {
+    log("normal", `  ERROR: no printerHost for ${ctx.clientIp}`);
+    socket.destroy();
+    return;
+  }
 
   const chunks = [];
   let pjlResponded = false;
@@ -600,11 +639,20 @@ function main() {
   log("normal", "SOTAX ST-50 Print Capture Proxy");
   log("normal", "─".repeat(60));
   log("normal", `Listen port   : ${cfg.listenPort}`);
-  log("normal", `Printer IP    : ${cfg.printerHost}`);
+  log("normal", `Printer IP    : ${cfg.printerHost}${listSourceRoutes(cfg).length ? " (default / unmapped)" : ""}`);
   log("normal", `Printer port  : ${cfg.printerPort}`);
   log("normal", `Output dir    : ${path.resolve(cfg.outputDir)}`);
+  const routes = listSourceRoutes(cfg);
+  if (routes.length) {
+    log("normal", `Source routes : ${routes.length} mapped client(s)`);
+    for (const r of routes) {
+      log("normal", `  ${r.name.padEnd(16)} ${r.ip} → ${r.printerHost}:${r.printerPort}`);
+    }
+    log("normal", `  (captures under ${path.resolve(cfg.outputDir)}<name>/…)`);
+  }
   if (cfg.organizeByJobMeta) {
-    log("normal", `Storage layout: ${cfg.storagePathTemplate || "{productId}/lot_{lot}/{side}"}`);
+    const under = routes.length ? "<name>/" : "";
+    log("normal", `Storage layout: ${under}${cfg.storagePathTemplate || "{productId}/lot_{lot}/{side}"}`);
   }
   const mode = (cfg.mode || "transparent").toLowerCase();
   log("normal", `Mode          : ${mode}${mode === "transparent" ? " (pipe ST-50 ↔ printer)" : " (buffer + PJL handling)"}`);
