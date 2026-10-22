@@ -21,6 +21,7 @@ const {
 const { classifyJob, DEFAULT_RECOGNIZED_TEST_TYPES } = require("./classify-test");
 const printQueue = require("./print-queue");
 const phpNotify = require("./php-notify");
+const keepAlive = require("./printer-keepalive");
 
 // ─── Configuration ────────────────────────────────────────────────────────────
 
@@ -57,6 +58,9 @@ const DEFAULT_CONFIG = {
   // these belong to another department and always auto-print (never held).
   recognizedTestTypes: DEFAULT_RECOGNIZED_TEST_TYPES,
   printQueueDir: "./print_queue", // held-job descriptors read by the PHP app
+  // Keep printers awake and answer ST-50 status probes without waiting on a
+  // sleeping printer (see printer-keepalive.js). Partial overrides are merged.
+  keepAlive: keepAlive.DEFAULT_KEEP_ALIVE,
   logLevel: "verbose",        // "verbose" | "normal" | "quiet"
   // Optional per–ST-50 routing (see README). When set, captures go to
   // outputDir/<name>/… and each source can use its own printerHost.
@@ -361,11 +365,20 @@ function forwardToPrinter(data, cfg) {
   return new Promise((resolve, reject) => {
     const client = new net.Socket();
     let forwarded = 0;
+    let connected = false;
+
+    // err.connected tells the caller whether job bytes may have reached the
+    // printer — only failures before connecting are safe to retry.
+    const fail = (err) => {
+      err.connected = connected;
+      reject(err);
+    };
 
     client.connect(cfg.printerPort, cfg.printerHost, () => {
+      connected = true;
       log("verbose", `  → Connected to printer ${cfg.printerHost}:${cfg.printerPort}`);
       client.write(data, (err) => {
-        if (err) return reject(err);
+        if (err) return fail(err);
         forwarded = data.length;
         client.end(); // graceful close after write
       });
@@ -383,14 +396,23 @@ function forwardToPrinter(data, cfg) {
 
     client.on("error", (err) => {
       log("normal", `  Printer forward error: ${err.message}`);
-      reject(err);
+      fail(err);
     });
 
     client.setTimeout(10000, () => {
       log("normal", `  Printer connection timed out.`);
+      fail(new Error("Printer connection timeout"));
       client.destroy();
-      reject(new Error("Printer connection timeout"));
     });
+  });
+}
+
+/** Forward a job, waking the printer first and retrying if it refuses. */
+function forwardJob(data, cfg) {
+  return keepAlive.forwardWithWake(data, cfg, {
+    forwardFn: forwardToPrinter,
+    probeFn: relayProbeForReply,
+    log,
   });
 }
 
@@ -411,7 +433,7 @@ const GENUINE_READY_STATUS = Buffer.from(
  * sees the same near-instant, byte-identical response it gets in transparent
  * mode. Rejects if the printer sends nothing.
  */
-function relayProbeForReply(payload, cfg) {
+function relayProbeForReply(payload, cfg, timeoutMs = 5000) {
   return new Promise((resolve, reject) => {
     const client = new net.Socket();
     const chunks = [];
@@ -435,7 +457,7 @@ function relayProbeForReply(payload, cfg) {
     });
     client.on("error", (err) => finish(err));
     client.on("end", () => finish());
-    client.setTimeout(5000, () =>
+    client.setTimeout(timeoutMs, () =>
       finish(chunks.length ? undefined : new Error("probe relay timeout"))
     );
 
@@ -472,24 +494,59 @@ function handleIntercept(clientSocket, baseCfg) {
   let jobDone = false;
   let loggedFirst = false;
 
+  // Answer the ST-50's status probe. A sleeping printer can take seconds to
+  // reply, longer than the ST-50 waits, so prefer the printer's own recent
+  // reply from the keep-alive cache, and otherwise fall back to the genuine
+  // canned status after a short deadline. The live relay still runs to
+  // refresh the cache (and wake the printer).
+  const ka = keepAlive.resolveSettings(cfg);
+  const target = keepAlive.targetOf(cfg);
+
   const replyToProbe = (probeData) => {
     probeInFlight = true;
-    return relayProbeForReply(probeData, cfg)
+
+    const send = (out, how) => {
+      if (probeHandled) return;
+      probeHandled = true;
+      if (!clientSocket.destroyed) clientSocket.write(out);
+      log("normal", `  → status reply to ST-50 (${out.length} B, ${how})`);
+      log("verbose", `  ${formatBytes(out)}`);
+    };
+
+    const cached = ka.enabled
+      ? keepAlive.getCachedReply(target, probeData, ka.statusCacheSeconds * 1000)
+      : null;
+    if (cached) send(cached.reply, `cached printer reply, ${Math.round(cached.ageMs / 1000)}s old`);
+
+    const started = Date.now();
+    const relay = () => relayProbeForReply(probeData, cfg);
+    const live = (ka.enabled ? keepAlive.withPrinter(target, relay) : relay())
       .then((reply) => {
-        const out = reply && reply.length ? reply : GENUINE_READY_STATUS;
-        if (!clientSocket.destroyed) clientSocket.write(out);
-        log("normal", `  → status reply to ST-50 (${out.length} B, verbatim from printer)`);
-        log("verbose", `  ${formatBytes(out)}`);
-        probeHandled = true;
+        keepAlive.recordReply(target, probeData, reply);
+        if (reply && reply.length) send(reply, `verbatim from printer, ${Date.now() - started} ms`);
+        else send(GENUINE_READY_STATUS, "genuine canned status — printer sent nothing");
       })
       .catch((err) => {
+        if (probeHandled) {
+          log("verbose", `  Background probe relay failed: ${err.message}`);
+          return;
+        }
         log("normal", `  Probe relay failed (${err.message}) — sending genuine canned status`);
-        if (!clientSocket.destroyed) clientSocket.write(GENUINE_READY_STATUS);
-        probeHandled = true;
-      })
-      .finally(() => {
-        probeInFlight = false;
+        send(GENUINE_READY_STATUS, "genuine canned status");
       });
+
+    let waitFor = live;
+    if (cached) {
+      waitFor = Promise.resolve();
+    } else if (ka.enabled) {
+      const deadline = new Promise((r) => setTimeout(r, ka.probeDeadlineMs)).then(() =>
+        send(GENUINE_READY_STATUS, `genuine canned status — printer slow to answer (>${ka.probeDeadlineMs} ms), likely waking`)
+      );
+      waitFor = Promise.race([live, deadline]);
+    }
+    return waitFor.finally(() => {
+      probeInFlight = false;
+    });
   };
 
   const maybeAnswerProbe = () => {
@@ -582,7 +639,7 @@ function handleIntercept(clientSocket, baseCfg) {
       log("normal", `  Decision: AUTO-PRINT (${why})`);
       if (cfg.forwardToPrinter) {
         try {
-          await forwardToPrinter(data, cfg);
+          await forwardJob(data, cfg);
         } catch (err) {
           log("normal", `  Forward failed: ${err.message}`);
         }
@@ -659,7 +716,7 @@ async function finishJob(socket, chunks, cfg, remote) {
         log("normal", `  Skipping forward — printerHost not configured for this source`);
       } else {
         try {
-          await forwardToPrinter(data, cfg);
+          await forwardJob(data, cfg);
         } catch (err) {
           log("normal", `  Forward failed: ${err.message}`);
         }
@@ -702,6 +759,7 @@ function handleTransparent(clientSocket, baseCfg) {
     return;
   }
 
+  const endSession = keepAlive.trackSession(keepAlive.targetOf(cfg));
   const printerSocket = new net.Socket();
   const st50ToPrinter = [];
   const printerToSt50 = [];
@@ -714,6 +772,7 @@ function handleTransparent(clientSocket, baseCfg) {
   const finish = () => {
     if (closed) return;
     closed = true;
+    endSession();
 
     const out = Buffer.concat(st50ToPrinter);
     const back = Buffer.concat(printerToSt50);
@@ -940,8 +999,17 @@ function main() {
       log("normal", `  Grid layout   : ${cfg.autoConvertForm ? "legacy label,value merge" : "1:1 table cells"}`);
     }
   }
+  const ka = keepAlive.resolveSettings(cfg);
+  log(
+    "normal",
+    `Keep-alive    : ${ka.enabled ? `every ${ka.intervalSeconds}s, ${ka.activeHours || "24/7"}; ST-50 probe deadline ${ka.probeDeadlineMs} ms` : "DISABLED"}`
+  );
   log("normal", `Log level     : ${cfg.logLevel}`);
   log("normal", "─".repeat(60));
+
+  const printerCfgs = [cfg, ...routes.map((r) => ({ ...cfg, printerHost: r.printerHost, printerPort: r.printerPort }))]
+    .filter((c) => isPrinterConfigured(c.printerHost));
+  keepAlive.start(cfg, printerCfgs, relayProbeForReply, log);
 
   const server = net.createServer((socket) => {
     if (mode === "transparent") handleTransparent(socket, cfg);
@@ -983,6 +1051,7 @@ module.exports = {
   handleTransparent,
   handleJob,
   relayProbeForReply,
+  forwardToPrinter,
   GENUINE_READY_STATUS,
 };
 
