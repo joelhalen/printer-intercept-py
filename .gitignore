@@ -7,3 +7,14 @@
 *.exe.*
 *.zip
 *.bat
+
+# Runtime data (also covered by extension rules above)
+captured_jobs/
+print_queue/
+sniff_logs/
+temp/print_jobs/*
+!temp/print_jobs/.gitkeep
+
+# Local editor / workspace files
+.idea/
+*.code-workspace
