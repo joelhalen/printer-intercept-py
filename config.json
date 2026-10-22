@@ -1,8 +1,8 @@
 {
   "listenPort": 9100,
-  "printerHost": "10.3.10.209",
+  "printerHost": "10.3.10.48",
   "printerPort": 9100,
-  "mode": "transparent",
+  "mode": "intercept",
   "outputDir": "./captured_jobs",
   "organizeByJobMeta": true,
   "storagePathTemplate": "{productId}/lot_{lot}/{side}",
@@ -12,5 +12,16 @@
   "autoConvertDir": "converted",
   "forwardToPrinter": true,
   "relayPjlToPrinter": true,
-  "logLevel": "verbose"
+  "holdHardnessAndInvalid": true,
+  "controlCenterDeviceId": 8,
+  "rsdLimit": 0.1,
+  "recognizedTestTypes": ["UNCOATED", "EASY\\s*TEST", "HARDNESS", "IN\\s*PR\\s*HARD"],
+  "printQueueDir": "./print_queue",
+  "logLevel": "verbose",
+  "convertToPs": {
+    "tempDir": "./temp/print_jobs",
+    "ghostscriptPath": "",
+    "libreOfficePath": "",
+    "wordComEnabled": true
+  }
 }

@@ -1,67 +1,86 @@
 /**
  * resend.js — Manually forward a previously captured .ps file to the printer.
  *
- * Usage:  node resend.js <path-to-job.ps>
- * Example: node resend.js captured_jobs/job_20240518_143022.ps
+ * Usage:
+ *   node resend.js <path-to-job.ps>
+ *   node resend.js <path-to-job.ps> --printer default
+ *   node resend.js <path-to-job.ps> --printer source:st50-line1
+ *   node resend.js --list-printers
  */
 
-const net = require("net");
 const fs = require("fs");
 const path = require("path");
+const { loadConfigFromFile } = require("./printer-config");
+const { listPrinterTargets, resolvePrinterTarget, sendToPrinter } = require("./printer-targets");
 
-const CONFIG_FILE = path.join(__dirname, "config.json");
+function parseArgs(argv) {
+  const args = argv.slice(2);
+  let filePath = null;
+  let printerId = null;
+  let listOnly = false;
 
-function loadConfig() {
-  if (!fs.existsSync(CONFIG_FILE)) {
-    console.error("config.json not found. Run proxy.js first to generate it.");
-    process.exit(1);
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--list-printers") {
+      listOnly = true;
+    } else if (a === "--printer" && args[i + 1]) {
+      printerId = args[++i];
+    } else if (!a.startsWith("-") && !filePath) {
+      filePath = a;
+    }
   }
-  return JSON.parse(fs.readFileSync(CONFIG_FILE, "utf8"));
+
+  return { filePath, printerId, listOnly };
 }
 
-function sendFile(filePath, cfg) {
-  if (!fs.existsSync(filePath)) {
-    console.error(`File not found: ${filePath}`);
+async function main() {
+  const cfg = loadConfigFromFile();
+  const { filePath, printerId, listOnly } = parseArgs(process.argv);
+
+  if (listOnly) {
+    const targets = listPrinterTargets(cfg);
+    if (targets.length === 0) {
+      console.log("No configured printer targets (set printerHost in config.json).");
+      process.exit(1);
+    }
+    console.log("Available printer targets:");
+    for (const t of targets) {
+      console.log(`  ${t.id.padEnd(20)} ${t.label}`);
+    }
+    return;
+  }
+
+  if (!filePath) {
+    console.error("Usage: node resend.js <path-to-job.ps> [--printer <id>]");
+    console.error("       node resend.js --list-printers");
     process.exit(1);
   }
 
-  const data = fs.readFileSync(filePath);
-  console.log(`Sending ${filePath} (${(data.length / 1024).toFixed(1)} KB) to ${cfg.printerHost}:${cfg.printerPort} ...`);
+  const resolved = path.resolve(filePath);
+  if (!fs.existsSync(resolved)) {
+    console.error(`File not found: ${resolved}`);
+    process.exit(1);
+  }
 
-  const client = new net.Socket();
+  const target = resolvePrinterTarget(cfg, printerId);
+  if (!target) {
+    console.error(printerId ? `Unknown printer id: ${printerId}` : "No printer configured in config.json");
+    console.error("Run: node resend.js --list-printers");
+    process.exit(1);
+  }
 
-  client.connect(cfg.printerPort, cfg.printerHost, () => {
-    console.log("Connected to printer.");
-    client.write(data, () => {
-      client.end();
-    });
-  });
+  const data = fs.readFileSync(resolved);
+  console.log(
+    `Sending ${resolved} (${(data.length / 1024).toFixed(1)} KB) → ${target.host}:${target.port} [${target.id}] ...`
+  );
 
-  client.on("data", (d) => {
-    console.log(`Printer response: ${d.length} bytes`);
-  });
-
-  client.on("close", () => {
-    console.log("Done. Job sent successfully.");
-  });
-
-  client.on("error", (err) => {
+  try {
+    const result = await sendToPrinter(data, target.host, target.port);
+    console.log(`Done. Sent ${result.bytes} bytes.`);
+  } catch (err) {
     console.error(`Error: ${err.message}`);
     process.exit(1);
-  });
-
-  client.setTimeout(10000, () => {
-    console.error("Connection timed out.");
-    client.destroy();
-    process.exit(1);
-  });
+  }
 }
 
-const arg = process.argv[2];
-if (!arg) {
-  console.error("Usage: node resend.js <path-to-job.ps>");
-  process.exit(1);
-}
-
-const cfg = loadConfig();
-sendFile(path.resolve(arg), cfg);
+main();
