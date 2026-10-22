@@ -12,11 +12,14 @@
   "autoConvertDir": "converted",
   "forwardToPrinter": true,
   "relayPjlToPrinter": true,
+<<<<<<< HEAD
   "holdHardnessAndInvalid": true,
   "controlCenterDeviceId": 8,
   "rsdLimit": 0.1,
   "recognizedTestTypes": ["UNCOATED", "EASY\\s*TEST", "HARDNESS", "IN\\s*PR\\s*HARD"],
   "printQueueDir": "./print_queue",
+=======
+>>>>>>> 9d83e39fb024317f3317155a5010e8a127578b4a
   "logLevel": "verbose",
   "convertToPs": {
     "tempDir": "./temp/print_jobs",
