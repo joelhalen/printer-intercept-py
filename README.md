@@ -211,6 +211,7 @@ Only `node.exe` (proxy.js) should listen while testing.
 | `print-document.js` | Convert (if needed) and print to a `config.json` printer target |
 | `csv-to-ps.js` | Built-in CSV → PostScript (fallback without LibreOffice) |
 | `printer-targets.js` | Printer list + JetDirect send (shared with PHP app) |
+| `printer-keepalive.js` | Keeps printers awake; instant ST-50 status replies; wake + retry before forwarding |
 | `config.json` | Configuration (edit this) |
 | `start-proxy.bat` | Windows launcher |
 | `captured_jobs/` | Saved .ps files appear here (auto-created) |
@@ -367,6 +368,48 @@ when Node.js and the print-server folder are available (`PRINT_SERVER_PATH`).
 | `relayPjlToPrinter` | `true` | `capture` mode only |
 | `logLevel` | `verbose` | `verbose` / `normal` / `quiet` |
 | `convertToPs` | see above | Paths and temp dir for PDF/DOCX/CSV → PS printing |
+| `keepAlive` | see below | Keep printers awake and answer ST-50 probes quickly |
+
+### Keeping the printer awake (`keepAlive`)
+
+Before every print the ST-50 asks the printer for its status and only waits a short
+time for the answer. A Xerox in power-saver mode can take several seconds to reply,
+so the ST-50 reports "printer not found". The proxy prevents this:
+
+- **Keep-alive:** every `intervalSeconds` it sends the ST-50's own status probe to each
+  printer (default printer and every `sources[]` printer). This keeps the printer
+  responsive and keeps a fresh copy of its real status reply.
+- **Instant replies (`intercept` mode):** the ST-50's probe is answered at once with that
+  cached printer reply. With nothing cached, the proxy waits at most `probeDeadlineMs`
+  for the printer, then answers with the genuine "Ready" status. Either way the job is
+  buffered and delivered below.
+- **Wake + retry:** before forwarding a job to a printer that has not answered recently,
+  the proxy sends a wake probe (up to `wakeTimeoutMs`). If the printer refuses the
+  connection it retries after each delay in `forwardRetryDelaysSeconds`. A job is
+  never re-sent once the printer has accepted the connection, so it cannot print twice.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `enabled` | `true` | `false` restores the old behavior (no polling, no deadline, no retries) |
+| `intervalSeconds` | `60` | How often each printer is polled |
+| `activeHours` | `""` | `""` = 24/7, or a local-time window like `"05:00-23:00"` (may wrap midnight) |
+| `statusCacheSeconds` | `180` | Max age of a cached reply used to answer the ST-50 |
+| `probeDeadlineMs` | `1500` | With no cached reply, answer the ST-50 after this long |
+| `wakeTimeoutMs` | `15000` | Max wait for a sleeping printer before forwarding a job |
+| `forwardRetryDelaysSeconds` | `[5, 15, 30]` | Wait before each retry when the printer refuses a job |
+
+Only the keys you set are changed, e.g. `"keepAlive": { "activeHours": "05:00-23:00" }`.
+
+The proxy logs `Printer … is responding` / `is NOT responding` when a printer's state
+changes, and each ST-50 status reply says whether it came from the cache, the printer
+live, or the deadline fallback (`printer slow to answer … likely waking`).
+
+Whether a status query alone stops the Xerox from going into deep sleep depends on its
+power-saver settings. If the logs still show slow answers, lengthen or turn off the sleep
+timer in the printer's power-saver settings (front panel or its web page). The instant
+replies above stop the "not found" error either way.
+
+Run the tests with `node --test test/*.test.js`.
 
 ---
 
@@ -389,6 +432,11 @@ when Node.js and the print-server folder are available (`PRINT_SERVER_PATH`).
 **ST-50 can't connect**
 > Confirm Windows Firewall allows port 9100 (see step 4).
 > Confirm both devices are on the same subnet.
+
+**ST-50 shows "printer not found" only sometimes (e.g. first print of the morning)**
+> The printer is probably asleep and answering too slowly. Use `mode: "intercept"` and
+> leave `keepAlive` enabled (see "Keeping the printer awake" above), then check the log
+> for `Printer … is NOT responding` or `likely waking`.
 
 **ST-50 shows "printer not found" but your laptop can connect**
 > Run `node diagnose.js <proxy-ip>` on a PC on the same network as the ST-50.
